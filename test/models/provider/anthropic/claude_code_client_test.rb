@@ -62,6 +62,21 @@ class Provider::Anthropic::ClaudeCodeClientTest < ActiveSupport::TestCase
     assert_equal "end_turn", message.stop_reason
   end
 
+  test "keeps a text answer that came without structured output" do
+    expect_cli(result: "I need more detail.", structured_output: nil)
+
+    message = @client.messages.create(
+      model: "claude-sonnet-5-5",
+      messages: [ { role: "user", content: "Categorize" } ],
+      tools: [ { name: "report_categorizations", input_schema: { type: "object" } } ],
+      tool_choice: { type: "auto", disable_parallel_tool_use: true }
+    )
+
+    assert_equal [ :text ], message.content.map(&:type)
+    assert_equal "I need more detail.", message.content.first.text
+    assert_equal "end_turn", message.stop_reason
+  end
+
   test "raises when the CLI reports an error" do
     Provider::Anthropic::ClaudeCodeClient.any_instance.stubs(:capture).returns(
       [ { type: "result", subtype: "success", is_error: true, result: "Invalid API key" }.to_json, "", stub(success?: true) ]
@@ -86,7 +101,41 @@ class Provider::Anthropic::ClaudeCodeClientTest < ActiveSupport::TestCase
     end
   end
 
+  test "times out a CLI that never reads its prompt" do
+    client = Provider::Anthropic::ClaudeCodeClient.new(token: "t", timeout: 0.5, executable: fake_cli("exec sleep 30"))
+
+    error = assert_raises(Provider::Anthropic::ClaudeCodeClient::Error) do
+      client.messages.create(model: "claude-haiku-5-5", messages: [ { role: "user", content: "x" * 1_000_000 } ])
+    end
+    assert_match "timed out", error.message
+  end
+
+  test "reports the CLI's own error when it exits without reading the prompt" do
+    script = %(echo '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in"}'; exit 1)
+    client = Provider::Anthropic::ClaudeCodeClient.new(token: "t", executable: fake_cli(script))
+
+    error = assert_raises(Provider::Anthropic::ClaudeCodeClient::Error) do
+      client.messages.create(model: "claude-haiku-5-5", messages: [ { role: "user", content: "x" * 1_000_000 } ])
+    end
+    assert_match "Not logged in", error.message
+  end
+
+  teardown do
+    Array(@fake_clis).each(&:unlink)
+  end
+
   private
+    def fake_cli(body)
+      file = Tempfile.new([ "claude", ".sh" ])
+      file.write("#!/bin/sh
+#{body}
+")
+      file.close
+      File.chmod(0o755, file.path)
+      (@fake_clis ||= []) << file
+      file.path
+    end
+
     def expect_cli(structured_output: nil, result: "", &check)
       payload = {
         type: "result", subtype: "success", is_error: false, session_id: "sess_1",
